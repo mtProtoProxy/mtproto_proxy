@@ -19,7 +19,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--define(MAX_SOCK_BUF_SIZE, 1024 * 300).    % Decrease if CPU is cheaper than RAM
+-define(MAX_SOCK_BUF_SIZE, 1024 * 50).    % Decrease if CPU is cheaper than RAM
 -define(MAX_UP_INIT_BUF_SIZE, 1024 * 1024).     %1mb
 
 -define(APP, mtproto_proxy).
@@ -214,17 +214,21 @@ state_timeout(stop) ->
 handle_upstream_data(<<Header:64/binary, Rest/binary>>, #state{stage = init, stage_state = <<>>,
                                                                secret = Secret} = S) ->
     case mtp_obfuscated:from_header(Header, Secret) of
-        {ok, DcId, ObfuscatedCodec} ->
+        {ok, DcId, PacketLayerMod, ObfuscatedCodec} ->
+            metric:count_inc([?APP, protocol_ok, total],
+                             1, #{labels => [PacketLayerMod]}),
             ObfuscatedLayer = mtp_layer:new(mtp_obfuscated, ObfuscatedCodec),
-            AbridgedLayer = mtp_layer:new(mtp_abridged, mtp_abridged:new()),
-            UpCodec = mtp_layer:new(mtp_wrap, mtp_wrap:new(AbridgedLayer,
+            PacketLayer = mtp_layer:new(PacketLayerMod, PacketLayerMod:new()),
+            UpCodec = mtp_layer:new(mtp_wrap, mtp_wrap:new(PacketLayer,
                                                            ObfuscatedLayer)),
             handle_upstream_header(
               DcId,
               S#state{up_codec = UpCodec,
                       up_acc = Rest,
                       stage_state = undefined});
-        Err ->
+        {error, unknown_protocol} = Err ->
+            metric:count_inc([?APP, protocol_error, total],
+                             1, #{labels => [unknown]}),
             Err
     end;
 handle_upstream_data(Bin, #state{stage = init, stage_state = <<>>} = S) ->
