@@ -1,11 +1,12 @@
 {application, mtproto_proxy,
- [{description, "An OTP application"},
-  {vsn, "0.1.0"},
+ [{description, "High-performance Telegram MTProto proxy server"},
+  {vsn, "0.7.0"},
   {registered, []},
   {mod, { mtproto_proxy_app, []}},
   {applications,
    [lager,
     ranch,
+    erlang_psq,
     crypto,
     ssl,
     inets,
@@ -13,37 +14,164 @@
     stdlib
    ]},
   {env,[
-        %% Close connection if it failed to perform handshake in this many seconds
-        {init_timeout_sec, 60},
-        {hibernate_timeout_sec, 60},
-        %% Close connection after this many seconds of inactivity
-        {ready_timeout_sec, 1200},
-
-        %% Telegram server uses your external IP address as part of encryption
-        %% key, so, you should know it.
-        %% You can configure IP lookup service by `ip_lookup_service' (should
-        %% return my IP address as one line from this URL) or set IP address
-        %% statically by `external_ip' (not both).
-        %% If both are unset, we will try to guess IP address
-        %% from getsockname().
-        {ip_lookup_service, "https://digitalresistance.dog/myIp"},
-        %% {external_ip, "YOUR.SERVER.EXTERNAL.IP"},
-
         %% Interface to listen for incoming connections
-        {ip, {0, 0, 0, 0}},
+        %% If not set, 0.0.0.0 will be used (listen on all IPs)
+        {listen_ip, "0.0.0.0"},
         %% You can add as much as you want. Names and ports should be unique
-        {ports, [#{name => mtp_handler,
+        {ports, [#{name => mtp_handler_1,
                    port => 1443,
+                   %% You can tell each port to listen on specific IP.
+                   %% If not set, top-level listen_ip will be used.
+                   %% listen_ip => "1.2.3.4",
+
                    %% secret should be 32 hex chars [0-9a-f]
                    secret => <<"d0d6e111bada5511fcce9584deadbeef">>,
                    %% tag is what you get from @MTProxybot
                    tag => <<"dcbe8f1493fa4cd9ab300891c0b5b326">>}]},
+
+        %% number of socket acceptors (per-port)
         {num_acceptors, 60},
-        {max_connections, 40960}
+        %% maximum number of open connections (per-port)
+        {max_connections, 64000},
+
+        %% It's possible to forbid connection from telegram client to proxy
+        %% with some of the protocols. Ti's recommended to set this to
+        %% only `{allowed_protocols, [mtp_secure, mtp_fake_tls]}` because those
+        %% protocols are more resistant to DPI detection. Connections by other
+        %% protocols will be immediately disallowed.
+        {allowed_protocols, [mtp_fake_tls, mtp_secure, mtp_abridged, mtp_intermediate]},
+
+        %% Connection policies.
+        %% See README.md for documentation
+        %% {policy,
+        %%  [{in_table, tls_domain, allowed_domains},
+        %%   {not_in_table, [client_ipv4], banned_ips},
+        %%   {max_connections, [port_name, tls_domain], 15}
+        %%  ]},
+
+        %% Close connection if it failed to perform handshake in this many seconds
+        {init_timeout_sec, 60},
+        %% Switch client to memory-saving mode after this many seconds of inactivity
+        {hibernate_timeout_sec, 60},
+        %% Close client connection after this many seconds of inactivity
+        {ready_timeout_sec, 1200},
+
+        %% Telegram server uses your external IP address as part of encryption
+        %% key, so, you should know it.
+        %% You can configure IP lookup services by `ip_lookup_services' (should
+        %% return my IP address as one line from this URL) or set IP address
+        %% statically by `external_ip' (not both).
+        %% If both are unset, proxy will try to guess IP address
+        %% from getsockname().
+        %% `ip_lookup_services' will be tried one-by-one: if 1st is not responding,
+        %% 2nd one will be tried and so on
+        {ip_lookup_services,
+         ["http://ipv4.seriyps.ru/",
+          "http://v4.ident.me/",
+          "http://ipv4.icanhazip.com/",
+          "https://digitalresistance.dog/myIp"]},
+        %% {external_ip, "YOUR.SERVER.EXTERNAL.IP"},
+
+        %% This option controls how proxy closes client sockets
+        %% (SO_LINGER timeout=0 socket option)
+        %% Can be useful if you have too many connection attempts with wrong
+        %% secret and protocol, which creates lots of sockets in
+        %% TIME_WAIT, ORPHANED and CLOSED state
+        %% Allowed values:
+        %% - off - never send RST
+        %% - handshake_error - (recommended) only send if client handshake failed because of:
+        %%   - wrong secret
+        %%   - disabled protocol
+        %%   - replay attack detected
+        %%   - policy check failed
+        %% - always - always close socket with RST
+        {reset_close_socket, off},
+
+        %% List of enabled replay-attack checks. See
+        %% https://habr.com/ru/post/452144/
+
+        %% server_error_filter - drop server error responses.
+        %% Values:
+        %%     first - drop server error only if it's 1st server packet
+        %%     on - drop all server error packets
+        %%     off - don't drop server errors
+        %% Default: off
+        {replay_check_server_error_filter, first},
+
+        %% Store last used 1st client packets in special storage, drop
+        %% connections with same 1st packet
+        %% Values: on/off
+        %% Default: off
+        {replay_check_session_storage, on},
+        %% Options for `mtp_session_storage` replay attack check
+        %% Those settings are not precise! They are checked not in realtime, but
+        %% once per minute.
+        {replay_check_session_storage_opts,
+         #{%% Start to remove oldest items if there are more than max_items
+           %% records in the storage
+           max_items => 4000000,
+           %% Start to remove oldest items if storage occupies more than
+           %% `max_memory_mb` megabytes of memory
+           %% One session uses ~130-150bytes on 64bit linux;
+           %% 1Gb will be enough to store ~8mln sessions, which is
+           %% 24 hours of ~90 connections per second
+           max_memory_mb => 512,
+           %% Remove items used for the last time more than `max_age_minutes`
+           %% minutes ago.
+           %% Less than 10 minutes doesn't make much sense
+           max_age_minutes => 360}}
+
+        %% Should be module with function `notify/4' exported.
+        %% See mtp_metric:notify/4 for details
+        %% {metric_backend, my_metric_backend},
+
+        %% User-space recv socket buffer sizes. Set to higher if you have
+        %% enough RAM
+        %% {upstream_socket_buffer_size, 51200},   %50kb
+        %% {downstream_socket_buffer_size, 512000},   %500kb
+
+        %% Whether we should check CRC32 sum of packets encoded with mtp_full
+        %% codec. Setting this to `false' decreases CPU usage. Default: true
+        %% {mtp_full_check_crc32, true},
+
+        %% Where to fetch telegram proxy configuration
+        %% Mostly used to testing
+        %% {proxy_secret_url, "https://core.telegram.org/getProxySecret"},
+        %% {proxy_config_url, "https://core.telegram.org/getProxyConfig"},
+
+        %% Upstream self-healthchecks tuning
+        %% {upstream_healthchecks,
+        %%  [{qlen, 300},         % if queue length >X - close connection
+        %%   {gc, 409600},        % if connection memory >X - do garbage collection
+        %%   {total_mem, 3145728} % if connection memory >X - close connection
+        %%  ]},
+
+        %% Multiplexing tuning
+        %% {init_dc_connections, 2},
+        %% {clients_per_dc_connection, 300},
+
+        %% Downstream backpressure tuning
+        %% Values are configured per downstream connection, so, for example, if
+        %% `clients_per_dc_connection' is 300 and current number of connections
+        %% is 60,000, then there will be 200 downstream connections, each will
+        %% keep reading data from it's socket unless there is 10mb of data or
+        %% 600 packets not yet delivered by it's upstreams to clients
+        %% `*_per_upstream' options are the same, but will be multiplied by the
+        %% number of upstreams currently connected to this downstream
+        %% {downstream_backpressure,
+        %%  #{%% 10mb; if not specified, it's 30kb * clients_per_dc_connection
+        %%    bytes_total => 10485760,
+        %%    %% if not specified, it's 2 * clients_per_dc_connection
+        %%    packets_total => 600,
+        %%    %% integer >= 1024
+        %%    %% if not specified this check is skipped
+        %%    bytes_per_upstream => 51200,         %50kb
+        %%    %% float >= 1
+        %%    %% if not specified this check is skipped
+        %%    packets_per_upstream => 3}}
        ]},
   {modules, []},
 
-  {maintainers, []},
   {licenses, ["Apache 2.0"]},
-  {links, []}
+  {links, [{"GitHub", "https://github.com/seriyps/mtproto_proxy"}]}
  ]}.

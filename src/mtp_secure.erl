@@ -7,7 +7,7 @@
 
 -module(mtp_secure).
 
--behaviour(mtp_layer).
+-behaviour(mtp_codec).
 
 -export([new/0,
          try_decode_packet/2,
@@ -19,11 +19,11 @@
 new() ->
     mtp_intermediate:new(#{padding => true}).
 
--spec try_decode_packet(binary(), codec()) -> {ok, binary(), codec()}
+-spec try_decode_packet(binary(), codec()) -> {ok, binary(), binary(), codec()}
                                                   | {incomplete, codec()}.
 try_decode_packet(Data, St) ->
     mtp_intermediate:try_decode_packet(Data, St).
 
--spec encode_packet(iodata(), codec()) -> iodata().
+-spec encode_packet(iodata(), codec()) -> {iodata(), codec()}.
 encode_packet(Data, St) ->
     mtp_intermediate:encode_packet(Data, St).

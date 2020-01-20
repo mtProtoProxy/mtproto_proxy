@@ -15,15 +15,28 @@
 
 %% API
 -export([start_link/0]).
--export([get_downstream/1,
-         get_downstream_safe/1,
-         get_secret/0]).
+-export([get_downstream_safe/2,
+         get_downstream_pool/1,
+         get_netloc/1,
+         get_netloc_safe/1,
+         get_secret/0,
+         status/0,
+         update/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
+-export_type([netloc_v4v6/0]).
+
+-type dc_id() :: integer().
+-type netloc() :: {inet:ip4_address(), inet:port_number()}.
+-type netloc_v4v6() :: {inet:ip_address(), inet:port_number()}.
+
+-include_lib("hut/include/hut.hrl").
 
 -define(TAB, ?MODULE).
+-define(IPS_KEY(DcId), {id, DcId}).
+-define(IDS_KEY, dc_ids).
 -define(SECRET_URL, "https://core.telegram.org/getProxySecret").
 -define(CONFIG_URL, "https://core.telegram.org/getProxyConfig").
 
@@ -32,6 +45,12 @@
 -record(state, {tab :: ets:tid(),
                 timer :: gen_timeout:tout()}).
 
+-ifndef(OTP_RELEASE).                           % pre-OTP21
+-define(WITH_STACKTRACE(T, R, S), T:R -> S = erlang:get_stacktrace(), ).
+-else.
+-define(WITH_STACKTRACE(T, R, S), T:R:S ->).
+-endif.
+
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -39,33 +58,75 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
--spec get_downstream(integer()) -> {ok, {inet:ip4_address(), inet:port_number()}}.
-get_downstream_safe(DcId) ->
-    case get_downstream(DcId) of
-        {ok, Addr} -> Addr;
+-spec get_downstream_safe(dc_id(), mtp_down_conn:upstream_opts()) ->
+                                 {dc_id(), pid(), mtp_down_conn:handle()}.
+get_downstream_safe(DcId, Opts) ->
+    case get_downstream_pool(DcId) of
+        {ok, Pool} ->
+            case mtp_dc_pool:get(Pool, self(), Opts) of
+                Downstream when is_pid(Downstream) ->
+                    {DcId, Pool, Downstream};
+                {error, empty} ->
+                    %% TODO: maybe sleep and retry?
+                    error({pool_empty, DcId, Pool})
+            end;
         not_found ->
-            [{_, {Min, Max}}] = ets:lookup(?TAB, id_range),
-            %% Get random DC; it might return 0 and recurse aggain
-            get_downstream_safe(crypto:rand_uniform(Min, Max + 1))
+            [{?IDS_KEY, L}] = ets:lookup(?TAB, ?IDS_KEY),
+            NewDcId = random_choice(L),
+            get_downstream_safe(NewDcId, Opts)
     end.
 
-get_downstream(DcId) ->
-    case ets:lookup(?TAB, {id, DcId}) of
+get_downstream_pool(DcId) ->
+    try whereis(mtp_dc_pool:dc_to_pool_name(DcId)) of
+        undefined -> not_found;
+        Pid when is_pid(Pid) -> {ok, Pid}
+    catch error:invalid_dc_id ->
+            not_found
+    end.
+
+-spec get_netloc_safe(dc_id()) -> {dc_id(), netloc()}.
+get_netloc_safe(DcId) ->
+    case get_netloc(DcId) of
+        {ok, Addr} -> {DcId, Addr};
+        not_found ->
+            [{?IDS_KEY, L}] = ets:lookup(?TAB, ?IDS_KEY),
+            NewDcId = random_choice(L),
+            %% Get random DC; it might return 0 and recurse aggain
+            get_netloc_safe(NewDcId)
+    end.
+
+get_netloc(DcId) ->
+    Key = ?IPS_KEY(DcId),
+    case ets:lookup(?TAB, Key) of
         [] ->
             not_found;
-        [{_, Ip, Port}] ->
-            {ok, {Ip, Port}};
-        L ->
-            Size = length(L),
-            Idx = crypto:rand_uniform(1, Size + 1),
-            {_, Ip, Port} = lists:nth(Idx, L),
-            {ok, {Ip, Port}}
+        [{Key, [{_, _} = IpPort]}] ->
+            {ok, IpPort};
+        [{Key, L}] ->
+            IpPort = random_choice(L),
+            {ok, IpPort}
     end.
+
 
 -spec get_secret() -> binary().
 get_secret() ->
     [{_, Key}] = ets:lookup(?TAB, key),
     Key.
+
+-spec status() -> [mtp_dc_pool:status()].
+status() ->
+    [{?IDS_KEY, L}] = ets:lookup(?TAB, ?IDS_KEY),
+    lists:map(
+      fun(DcId) ->
+              {ok, Pid} = get_downstream_pool(DcId),
+              mtp_dc_pool:status(Pid)
+      end, L).
+
+
+-spec update() -> ok.
+update() ->
+    gen_server:cast(?MODULE, update).
+
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -74,31 +135,38 @@ init([]) ->
     Timer = gen_timeout:new(
               #{timeout => {env, ?APP, conf_refresh_interval, 3600},
                 unit => second}),
-    Tab = ets:new(?TAB, [bag,
-                         protected,
+    Tab = ets:new(?TAB, [set,
+                         public,
                          named_table,
                          {read_concurrency, true}]),
-    {ok, update(#state{tab = Tab,
-                       timer = Timer}, force)}.
+    State = #state{tab = Tab,
+                   timer = Timer},
+    update(State, force),
+    {ok, State}.
+
 %%--------------------------------------------------------------------
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
-handle_cast(_Msg, State) ->
-    {noreply, State}.
+
+handle_cast(update, #state{timer = Timer} = State) ->
+    update(State, soft),
+    ?log(info, "Config updated"),
+    Timer1 = gen_timeout:bump(
+               gen_timeout:reset(Timer)),
+    {noreply, State#state{timer = Timer1}}.
+
 handle_info(timeout, #state{timer = Timer} =State) ->
     case gen_timeout:is_expired(Timer) of
         true ->
             update(State, soft),
-            lager:info("Config updated"),
+            ?log(info, "Config updated"),
             Timer1 = gen_timeout:bump(
                        gen_timeout:reset(Timer)),
             {noreply, State#state{timer = Timer1}};
         false ->
             {noreply, State#state{timer = gen_timeout:reset(Timer)}}
-    end;
-handle_info(_Info, State) ->
-    {noreply, State}.
+    end.
 terminate(_Reason, _State) ->
     ok.
 code_change(_OldVsn, State, _Extra) ->
@@ -109,27 +177,27 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 update(#state{tab = Tab}, force) ->
+    update_ip(),
     update_key(Tab),
-    update_config(Tab),
-    update_ip();
+    update_config(Tab);
 update(State, _) ->
     try update(State, force)
-    catch Class:Reason ->
-            lager:error(
-              "Err updating proxy settings: ~s",
-              [lager:pr_stacktrace(erlang:get_stacktrace(), {Class, Reason})])
+    catch ?WITH_STACKTRACE(Class, Reason, Stack)
+            ?log(error, "Err updating proxy settings: ~s",
+                 [lager:pr_stacktrace(Stack, {Class, Reason})]) %XXX lager-specific
     end.
 
 update_key(Tab) ->
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(?SECRET_URL),
+    Url = application:get_env(mtproto_proxy, proxy_secret_url, ?SECRET_URL),
+    {ok, Body} = http_get(Url),
     true = ets:insert(Tab, {key, list_to_binary(Body)}).
 
 update_config(Tab) ->
-    {ok, {{_, 200, _}, _, Body}} = httpc:request(?CONFIG_URL),
+    Url = application:get_env(mtproto_proxy, proxy_config_url, ?CONFIG_URL),
+    {ok, Body} = http_get(Url),
     Downstreams = parse_config(Body),
-    Range = get_range(Downstreams),
     update_downstreams(Downstreams, Tab),
-    update_range(Range, Tab).
+    update_ids(Downstreams, Tab).
 
 parse_config(Body) ->
     Lines = string:lexemes(Body, "\n"),
@@ -150,27 +218,69 @@ parse_downstream(Line) ->
      IpAddr,
      Port}.
 
-get_range(Downstreams) ->
-    IDsList = [Id || {Id, _, _} <- Downstreams],
-    {lists:min(IDsList),
-     lists:max(IDsList)}.
-
 update_downstreams(Downstreams, Tab) ->
-    [true = ets:insert(Tab, {{id, Id}, Ip, Port})
-     || {Id, Ip, Port} <- Downstreams].
+    ByDc = lists:foldl(
+             fun({DcId, Ip, Port}, Acc) ->
+                     Netlocs = maps:get(DcId, Acc, []),
+                     Acc#{DcId => [{Ip, Port} | Netlocs]}
+             end, #{}, Downstreams),
+    [true = ets:insert(Tab, {?IPS_KEY(DcId), Netlocs})
+     || {DcId, Netlocs} <- maps:to_list(ByDc)],
+    lists:foreach(
+      fun(DcId) ->
+              case get_downstream_pool(DcId) of
+                  not_found ->
+                      {ok, _Pid} = mtp_dc_pool_sup:start_pool(DcId);
+                  {ok, _} ->
+                      ok
+              end
+      end,
+      maps:keys(ByDc)).
 
-update_range(Range, Tab) ->
-    true = ets:insert(Tab, {id_range, Range}).
+update_ids(Downstreams, Tab) ->
+    Ids = lists:usort([DcId || {DcId, _, _} <- Downstreams]),
+    true = ets:insert(Tab, {?IDS_KEY, Ids}).
 
 update_ip() ->
-    case application:get_env(?APP, ip_lookup_service) of
+    case application:get_env(?APP, ip_lookup_services) of
         undefined -> false;
-        {ok, URL} ->
-            {ok, {{_, 200, _}, _, Body}} = httpc:request(URL),
-            IpStr= string:trim(Body),
-            {ok, _} = inet:parse_ipv4strict_address(IpStr), %assert
-            application:set_env(?APP, external_ip, IpStr)
+        {ok, URLs} ->
+            update_ip(URLs)
     end.
+
+update_ip([Url | Fallbacks]) ->
+    try
+        {ok, Body} = http_get(Url),
+        IpStr= string:trim(Body),
+        {ok, _} = inet:parse_ipv4strict_address(IpStr), %assert
+        application:set_env(?APP, external_ip, IpStr)
+    catch ?WITH_STACKTRACE(Class, Reason, Stack)
+            ?log(error, "Failed to update IP with ~s service: ~s",
+                 [Url, lager:pr_stacktrace(Stack, {Class, Reason})]), %XXX - lager-specific
+            update_ip(Fallbacks)
+    end;
+update_ip([]) ->
+    error(ip_lookup_failed).
+
+-ifdef(OTP_VERSION).
+%% XXX: ipfamily only works on OTP >= 20.3.4; see OTP 2dc08b47e6a5ea759781479593c55bb5776cd828
+%% Enable it for OTP 21+ for simplicity
+-define(OPTS, [{socket_opts, [{ipfamily, inet}]}]).
+-else.
+-define(OPTS, []).
+-endif.
+
+http_get(Url) ->
+    {ok, Vsn} = application:get_key(mtproto_proxy, vsn),
+    UserAgent = "MTProtoProxy/" ++ Vsn ++ " (+https://github.com/seriyps/mtproto_proxy)",
+    Headers = [{"User-Agent", UserAgent}],
+    {ok, {{_, 200, _}, _, Body}} =
+        httpc:request(get, {Url, Headers}, [{timeout, 3000}], ?OPTS),
+    {ok, Body}.
+
+random_choice(L) ->
+    Idx = rand:uniform(length(L)),
+    lists:nth(Idx, L).
 
 
 -ifdef(TEST).

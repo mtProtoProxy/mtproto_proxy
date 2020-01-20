@@ -1,9 +1,18 @@
+sudo: required
 language: erlang
 otp_release:
+  - 22.0
+  - 21.3
   - 21.0
   - 20.3
   #- 19.3 not supported (string:lexemes/2)
   #- 18.3 not supported (string:lexemes/2, tricky binary comprehension, map typespec with `:=`, ?assertEqual/3)
+install:
+  - sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
 script:
   - ./rebar3 compile
+  - ./rebar3 xref
   - ./rebar3 eunit
+  - ./rebar3 ct
+  - ./rebar3 dialyzer
+  - ./rebar3 proper
